@@ -126,13 +126,20 @@ jobs:
             severitate HIGH sau CRITICAL);
           - un tabel: severitate, fișier:linie, problemă, scenariu de atac, remediere;
           - la final, domeniul analizat (diff-ul sau „audit complet”).
-          Nu modifica alte fișiere și nu face commit.
+          Nu modifica alte fișiere și nu face commit. Dacă totuși nu poți scrie fișierul, tipărește
+          raportul complet, cu aceeași structură (prima linie REZULTAT), ca răspuns final.
           EOF
+          # Edit poate modifica doar un fișier existent: îl creăm gol, ca regula Edit(security-report.md) să ajungă
+          : > security-report.md
           claude -p "$(cat /tmp/prompt.txt)" \
             --model claude-sonnet-5-5 \
-            --max-turns 40 \
+            --max-turns 60 \
             --allowedTools "Read,Grep,Glob,Edit(security-report.md)" \
-            --output-format text
+            --output-format text | tee claude-output.txt
+          # Plasă de siguranță: dacă fișierul a rămas gol, raportul e chiar răspunsul final al lui Claude
+          if [ ! -s security-report.md ] && [ -s claude-output.txt ]; then
+            cp claude-output.txt security-report.md
+          fi
 
       - name: Publică raportul
         if: always() && steps.token.outputs.exista == 'true'
