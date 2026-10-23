@@ -1,0 +1,167 @@
+name: Security Review
+
+# Analiză de securitate cu Claude Code, rulată automat. Autentificarea folosește tokenul
+# de abonament (`claude setup-token`) din secretul de repo CLAUDE_CODE_OAUTH_TOKEN, nu o cheie API.
+# Fără secret, analiza se sare cu un avertisment (run verde), ca să nu apară run-uri roșii
+# până când secretul e adăugat.
+#
+# Când rulează:
+#   - pull_request: analizează doar diferențele PR-ului și comentează rezultatul pe PR;
+#   - push pe main/master: analizează commit-urile noi (before..after);
+#   - schedule (luni, 05:00 UTC) și workflow_dispatch: audit complet al repo-ului.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write  # comentariul cu rezultatul pe PR
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Verifică secretul CLAUDE_CODE_OAUTH_TOKEN
+        id: token
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::Lipsește secretul CLAUDE_CODE_OAUTH_TOKEN (Settings → Secrets and variables → Actions). Analiza e sărită."
+            echo "exista=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "exista=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.token.outputs.exista == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      # Ce se analizează depinde de eveniment: diff pentru PR/push, tot repo-ul pentru audit programat
+      - name: Stabilește domeniul analizei
+        id: domeniu
+        if: steps.token.outputs.exista == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request) echo "diff=$PR_BASE...HEAD" >> "$GITHUB_OUTPUT" ;;
+            push)
+              # La primul push pe o ramură `before` e numai zerouri: analizăm doar ultimul commit
+              if echo "$PUSH_BEFORE" | grep -qE '^0+$'; then
+                echo "diff=HEAD~1..HEAD" >> "$GITHUB_OUTPUT"
+              else
+                echo "diff=$PUSH_BEFORE..HEAD" >> "$GITHUB_OUTPUT"
+              fi ;;
+            *) echo "diff=" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: actions/setup-node@v7
+        if: steps.token.outputs.exista == 'true'
+        with:
+          node-version: '24'
+
+      # Instalare într-un pas fără secret în mediu și cu versiune fixată: scripturile npm nu văd tokenul.
+      # postinstall-ul descarcă binarul nativ; fără --allow-scripts npm îl sare și CLI-ul nu pornește.
+      - name: Instalează Claude Code CLI
+        if: steps.token.outputs.exista == 'true'
+        env:
+          CLAUDE_CODE_VERSION: 2.1.309
+        run: |
+          npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" >/dev/null
+          claude --version
+
+      # Diff-ul se generează aici, în workspace (Claude citește doar sub directorul de lucru), ca să primească doar unelte de citire, fără Bash
+      - name: Pregătește diff-ul
+        if: steps.token.outputs.exista == 'true' && steps.domeniu.outputs.diff != ''
+        env:
+          DIFF: ${{ steps.domeniu.outputs.diff }}
+        run: git diff "$DIFF" > security-changes.diff && wc -l security-changes.diff
+
+      # Claude Code CLI direct, nu claude-code-action: acțiunea nu acceptă evenimentul push
+      - name: Analiză de securitate cu Claude
+        if: steps.token.outputs.exista == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          DIFF: ${{ steps.domeniu.outputs.diff }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -o pipefail
+          if [ -n "$DIFF" ]; then
+            DOMENIU="analizează DOAR modificările din fișierul security-changes.diff (diff-ul $DIFF); citește fișierele întregi din repo doar pentru context"
+          else
+            DOMENIU="fă un audit complet al repo-ului (fără dependențe vendorizate: vendor/, node_modules/, fișiere generate sau minificate)"
+          fi
+          cat > /tmp/prompt.txt <<EOF
+          Ești un auditor de securitate pentru repo-ul $REPO. Citește întâi README-ul și structura
+          repo-ului ca să înțelegi ce face proiectul și cum e rulat (aplicație, imagine Docker, scripturi etc.).
+
+          Domeniu: $DOMENIU.
+
+          Caută vulnerabilități reale, exploatabile: injecții (SQL, comenzi, XSS, header), autentificare și
+          autorizare greșite, CSRF, SSRF, deserializare, path traversal, secrete în cod sau în imagine,
+          permisiuni de fișiere și servicii prea largi, dependențe sau versiuni cu CVE-uri cunoscute,
+          configurări nesigure (servere web, containere, workflow-uri GitHub Actions). Ignoră stilul și
+          false pozitivele teoretice; fiecare constatare trebuie să aibă un scenariu concret de atac.
+
+          Scrie raportul în română în fișierul security-report.md, cu structura:
+          - prima linie exact "REZULTAT: CURAT" sau "REZULTAT: VULNERABIL" (VULNERABIL doar pentru
+            severitate HIGH sau CRITICAL);
+          - un tabel: severitate, fișier:linie, problemă, scenariu de atac, remediere;
+          - la final, domeniul analizat (diff-ul sau „audit complet”).
+          Nu modifica alte fișiere și nu face commit.
+          EOF
+          claude -p "$(cat /tmp/prompt.txt)" \
+            --model claude-sonnet-5-5 \
+            --max-turns 40 \
+            --allowedTools "Read,Grep,Glob,Edit(security-report.md)" \
+            --output-format text
+
+      - name: Publică raportul
+        if: always() && steps.token.outputs.exista == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ ! -s security-report.md ]; then
+            echo "::error::Claude nu a produs security-report.md."
+            exit 1
+          fi
+          cat security-report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$PR" ]; then
+            gh pr comment "$PR" --body-file security-report.md
+          fi
+
+      - name: Salvează raportul ca artefact
+        if: always() && steps.token.outputs.exista == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-report
+          path: security-report.md
+          if-no-files-found: ignore
+
+      # Jobul pică doar pentru constatări HIGH/CRITICAL, ca să se vadă în lista de run-uri
+      - name: Verifică rezultatul
+        if: steps.token.outputs.exista == 'true'
+        run: |
+          if head -1 security-report.md 2>/dev/null | grep -q 'REZULTAT: VULNERABIL'; then
+            echo "::error::Analiza a găsit vulnerabilități HIGH/CRITICAL. Vezi raportul din Summary."
+            exit 1
+          fi
